@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
@@ -8,11 +8,17 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Download, ShoppingCart, RotateCw, ZoomIn, ZoomOut } from "lucide-react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useToast } from "@/hooks/use-toast";
+import { jewelryAPI, jewelryQueries } from "@/lib/api";
+import ThreeJS3DViewer from "./ThreeJS3DViewer";
 import customizationInterface from "@assets/generated_images/3D_jewelry_customization_interface_446cd61a.png";
 
 export default function JewelryCustomizer() {
-  // todo: remove mock functionality
-  const [selectedJewelry, setSelectedJewelry] = useState("mandala-necklace");
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
+  
+  const [selectedJewelry, setSelectedJewelry] = useState("");
   const [parameters, setParameters] = useState({
     size: [1.0],
     thickness: [0.2],
@@ -24,18 +30,163 @@ export default function JewelryCustomizer() {
   const [customText, setCustomText] = useState("");
   const [selectedPattern, setSelectedPattern] = useState("mandala");
   const [material, setMaterial] = useState("gold");
+  const [currentGeometry, setCurrentGeometry] = useState<any>(null);
+  const [currentCustomizationId, setCurrentCustomizationId] = useState<string | null>(null);
+
+  // Fetch jewelry designs
+  const { data: allDesigns = [] } = useQuery(jewelryQueries.allDesigns());
+  
+  // Fetch geometry patterns
+  const { data: allPatterns = [] } = useQuery(jewelryQueries.allPatterns());
+
+  // Get current design
+  const currentDesign = allDesigns.find(d => d.id === selectedJewelry);
+
+  // Set default selection when designs load
+  useEffect(() => {
+    if (allDesigns.length > 0 && !selectedJewelry) {
+      setSelectedJewelry(allDesigns[0].id);
+    }
+  }, [allDesigns, selectedJewelry]);
+
+  // Create customization mutation
+  const createCustomizationMutation = useMutation({
+    mutationFn: (data: any) => jewelryAPI.createCustomization(data),
+    onSuccess: (customization) => {
+      setCurrentCustomizationId(customization.id);
+      queryClient.invalidateQueries({ queryKey: ['/api/jewelry/customizations'] });
+      toast({
+        title: "Customization Created",
+        description: "Your jewelry design has been saved successfully.",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error.message || "Failed to create customization",
+        variant: "destructive",
+      });
+    },
+  });
+
+  // Generate 3D model mutation
+  const generate3DMutation = useMutation({
+    mutationFn: (id: string) => jewelryAPI.generate3D(id),
+    onSuccess: (result) => {
+      setCurrentGeometry(result.geometry);
+      toast({
+        title: "3D Model Generated",
+        description: "Your jewelry model is ready for download!",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error.message || "Failed to generate 3D model",
+        variant: "destructive",
+      });
+    },
+  });
+
+  // Parameter validation mutation
+  const validateParametersMutation = useMutation({
+    mutationFn: (params: any) => jewelryAPI.validateParameters(params),
+    onError: (error: any) => {
+      toast({
+        title: "Invalid Parameters",
+        description: error.message || "Some parameters are out of range",
+        variant: "destructive",
+      });
+    },
+  });
 
   const handleParameterChange = (param: string, value: number[]) => {
-    setParameters(prev => ({ ...prev, [param]: value }));
+    const newParameters = { ...parameters, [param]: value };
+    setParameters(newParameters);
+    
+    // Validate parameters in real-time
+    const flatParams = Object.entries(newParameters).reduce((acc, [key, val]) => {
+      acc[key] = Array.isArray(val) ? val[0] : val;
+      return acc;
+    }, {} as any);
+    
+    validateParametersMutation.mutate(flatParams);
     console.log(`Parameter ${param} changed to:`, value[0]);
   };
 
-  const handleDownloadSTL = () => {
-    console.log('Downloading STL with parameters:', parameters);
+  const handleDownloadSTL = async () => {
+    if (!currentCustomizationId) {
+      toast({
+        title: "No Customization",
+        description: "Please save your design first",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    try {
+      const blob = await jewelryAPI.downloadSTL(currentCustomizationId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `sacred-geometry-jewelry-${currentCustomizationId}.stl`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      toast({
+        title: "STL Downloaded",
+        description: "Your 3D print file has been downloaded successfully!",
+      });
+    } catch (error: any) {
+      toast({
+        title: "Download Failed",
+        description: error.message || "Failed to download STL file",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleSaveCustomization = async () => {
+    if (!currentDesign) return;
+
+    const flatParams = Object.entries(parameters).reduce((acc, [key, val]) => {
+      acc[key] = Array.isArray(val) ? val[0] : val;
+      return acc;
+    }, {} as any);
+
+    const basePrice = parseFloat(currentDesign.basePrice);
+    const priceMultiplier = validateParametersMutation.data?.priceMultiplier || 1;
+    const finalPrice = basePrice * priceMultiplier;
+
+    const customizationData = {
+      designId: selectedJewelry,
+      patternId: allPatterns.find(p => p.type === selectedPattern)?.id,
+      customParameters: flatParams,
+      customText: customText || undefined,
+      material,
+      fingerSize: flatParams.fingerSize,
+      finalPrice,
+    };
+
+    createCustomizationMutation.mutate(customizationData);
+  };
+
+  const handleGenerate3D = () => {
+    if (currentCustomizationId) {
+      generate3DMutation.mutate(currentCustomizationId);
+    } else {
+      toast({
+        title: "Save First",
+        description: "Please save your customization before generating 3D model",
+        variant: "destructive",
+      });
+    }
   };
 
   const handleAddToCart = () => {
-    console.log('Adding customized jewelry to cart:', { selectedJewelry, parameters, customText });
+    handleSaveCustomization();
   };
 
   const handleRotate = () => {
@@ -82,26 +233,58 @@ export default function JewelryCustomizer() {
             </CardHeader>
             <CardContent>
               <div className="aspect-video bg-gradient-to-br from-muted to-muted/50 rounded-lg overflow-hidden relative">
-                <img 
-                  src={customizationInterface} 
-                  alt="3D Jewelry Customization Interface"
-                  className="w-full h-full object-cover"
-                  data-testid="img-3d-preview"
+                <ThreeJS3DViewer
+                  jewelryType={currentDesign?.type || 'necklace'}
+                  patternType={selectedPattern}
+                  parameters={Object.entries(parameters).reduce((acc, [key, val]) => {
+                    acc[key] = Array.isArray(val) ? val[0] : val;
+                    return acc;
+                  }, {} as any)}
+                  onGeometryUpdate={setCurrentGeometry}
                 />
                 <div className="absolute bottom-4 left-4">
-                  <Badge variant="secondary" data-testid="badge-render-quality">High Quality Render</Badge>
+                  <Badge variant="secondary" data-testid="badge-render-quality">
+                    {currentGeometry ? 
+                      `${currentGeometry.vertexCount} vertices` : 
+                      'Real-time Preview'
+                    }
+                  </Badge>
                 </div>
               </div>
               
               <div className="flex gap-4 mt-6">
-                <Button className="flex-1" onClick={handleAddToCart} data-testid="button-add-to-cart">
+                <Button 
+                  className="flex-1" 
+                  onClick={handleAddToCart}
+                  disabled={createCustomizationMutation.isPending}
+                  data-testid="button-add-to-cart"
+                >
                   <ShoppingCart className="w-4 h-4 mr-2" />
-                  Add to Cart - $89
+                  {createCustomizationMutation.isPending ? 'Saving...' : 
+                    `Add to Cart - $${currentDesign ? 
+                      (parseFloat(currentDesign.basePrice) * (validateParametersMutation.data?.priceMultiplier || 1)).toFixed(2) : 
+                      '0.00'}`
+                  }
                 </Button>
-                <Button variant="outline" className="flex-1" onClick={handleDownloadSTL} data-testid="button-download-stl">
-                  <Download className="w-4 h-4 mr-2" />
-                  Download STL
-                </Button>
+                <div className="flex gap-2 flex-1">
+                  <Button 
+                    variant="outline" 
+                    onClick={handleGenerate3D}
+                    disabled={!currentCustomizationId || generate3DMutation.isPending}
+                    data-testid="button-generate-3d"
+                  >
+                    {generate3DMutation.isPending ? 'Generating...' : 'Generate 3D'}
+                  </Button>
+                  <Button 
+                    variant="outline" 
+                    onClick={handleDownloadSTL}
+                    disabled={!currentGeometry}
+                    data-testid="button-download-stl"
+                  >
+                    <Download className="w-4 h-4 mr-2" />
+                    STL
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -120,10 +303,11 @@ export default function JewelryCustomizer() {
                   <SelectValue placeholder="Choose base design" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="mandala-necklace">Mandala Harmony Necklace</SelectItem>
-                  <SelectItem value="fibonacci-necklace">Fibonacci Spiral Necklace</SelectItem>
-                  <SelectItem value="lotus-earrings">Sacred Lotus Earrings</SelectItem>
-                  <SelectItem value="merkaba-ring">Merkaba Ring</SelectItem>
+                  {allDesigns.map((design) => (
+                    <SelectItem key={design.id} value={design.id}>
+                      {design.name}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </CardContent>
@@ -198,7 +382,7 @@ export default function JewelryCustomizer() {
                     />
                   </div>
 
-                  {selectedJewelry.includes('ring') && (
+                  {currentDesign?.type === 'ring' && (
                     <div>
                       <Label htmlFor="finger-size-slider" data-testid="label-finger-size">Ring Size: {parameters.fingerSize[0]}</Label>
                       <Slider
@@ -223,11 +407,11 @@ export default function JewelryCustomizer() {
                         <SelectValue placeholder="Choose pattern" />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="mandala">Mandala</SelectItem>
-                        <SelectItem value="flower-of-life">Flower of Life</SelectItem>
-                        <SelectItem value="fibonacci">Fibonacci Spiral</SelectItem>
-                        <SelectItem value="islamic">Islamic Geometry</SelectItem>
-                        <SelectItem value="celtic">Celtic Knots</SelectItem>
+                        {allPatterns.map((pattern) => (
+                          <SelectItem key={pattern.id} value={pattern.type}>
+                            {pattern.name}
+                          </SelectItem>
+                        ))}
                       </SelectContent>
                     </Select>
                   </div>
