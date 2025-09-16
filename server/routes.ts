@@ -123,10 +123,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ error: "Customization not found" });
       }
 
-      // TODO: Implement actual 3D model generation with sacred geometry algorithms
-      // For now, simulate the process
-      console.log("Generating 3D model for customization:", id);
-      console.log("Parameters:", customization.customParameters);
+      // Get the jewelry design
+      const design = await storage.getJewelryDesign(customization.designId);
+      if (!design) {
+        return res.status(404).json({ error: "Design not found" });
+      }
+
+      // Import jewelry generation functions
+      const { generateJewelry } = await import("./geometry/jewelry-generator");
+      
+      // Get pattern type from customization or design
+      const patternType = customization.patternId ? 
+        (await storage.getGeometryPattern(customization.patternId))?.type || 'mandala' : 
+        'mandala';
+      
+      // Generate 3D jewelry geometry
+      const jewelryGeometry = generateJewelry(
+        design.type as 'necklace' | 'earrings' | 'ring',
+        patternType,
+        customization.customParameters as any,
+        {
+          fingerSize: customization.fingerSize ? parseFloat(customization.fingerSize) : undefined
+        }
+      );
+      
+      console.log("Generated 3D geometry for customization:", id);
+      console.log("Vertices:", jewelryGeometry.pattern.vertices.length);
+      console.log("Faces:", jewelryGeometry.pattern.faces.length);
       
       // Mark as generated
       await storage.updateCustomizationSTL(id, true);
@@ -134,7 +157,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({ 
         success: true, 
         message: "3D model generated successfully",
-        downloadUrl: `/api/jewelry/download-stl/${id}`
+        downloadUrl: `/api/jewelry/download-stl/${id}`,
+        geometry: {
+          vertexCount: jewelryGeometry.pattern.vertices.length,
+          faceCount: jewelryGeometry.pattern.faces.length,
+          boundingBox: jewelryGeometry.boundingBox
+        }
       });
     } catch (error) {
       console.error("Error generating 3D model:", error);
@@ -155,12 +183,35 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "STL file not generated yet" });
       }
 
-      // TODO: Generate and return actual STL file
-      // For now, return a placeholder response
-      const stlContent = generateMockSTL(customization);
+      // Get the jewelry design
+      const design = await storage.getJewelryDesign(customization.designId);
+      if (!design) {
+        return res.status(404).json({ error: "Design not found" });
+      }
+
+      // Import jewelry generation functions
+      const { generateJewelry } = await import("./geometry/jewelry-generator");
+      
+      // Get pattern type
+      const patternType = customization.patternId ? 
+        (await storage.getGeometryPattern(customization.patternId))?.type || 'mandala' : 
+        'mandala';
+      
+      // Regenerate 3D jewelry geometry for STL export
+      const jewelryGeometry = generateJewelry(
+        design.type as 'necklace' | 'earrings' | 'ring',
+        patternType,
+        customization.customParameters as any,
+        {
+          fingerSize: customization.fingerSize ? parseFloat(customization.fingerSize) : undefined
+        }
+      );
+      
+      // Generate STL content
+      const stlContent = generateSTLFromGeometry(jewelryGeometry.pattern);
       
       res.setHeader('Content-Type', 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename="jewelry-${id}.stl"`);
+      res.setHeader('Content-Disposition', `attachment; filename="sacred-geometry-jewelry-${id}.stl"`);
       res.send(stlContent);
     } catch (error) {
       console.error("Error downloading STL:", error);
@@ -252,27 +303,58 @@ export async function registerRoutes(app: Express): Promise<Server> {
   return httpServer;
 }
 
-// Helper function to generate mock STL content
-function generateMockSTL(customization: any): string {
-  const params = customization.customParameters;
+// Helper function to generate STL content from geometry
+function generateSTLFromGeometry(pattern: { vertices: any[]; faces: number[][] }): string {
+  let stl = "solid Sacred_Geometry_Jewelry\n";
   
-  // Simple STL header and basic triangle data
-  return `solid Sacred_Geometry_Jewelry
-facet normal 0.0 0.0 1.0
-  outer loop
-    vertex 0.0 0.0 0.0
-    vertex ${params.size || 1.0} 0.0 0.0
-    vertex 0.5 ${(params.size || 1.0) * 0.866} 0.0
-  endloop
-endfacet
-facet normal 0.0 0.0 -1.0
-  outer loop
-    vertex 0.0 0.0 ${params.thickness || 0.2}
-    vertex 0.5 ${(params.size || 1.0) * 0.866} ${params.thickness || 0.2}
-    vertex ${params.size || 1.0} 0.0 ${params.thickness || 0.2}
-  endloop
-endfacet
-endsolid Sacred_Geometry_Jewelry`;
+  // Generate each triangle face
+  pattern.faces.forEach(face => {
+    if (face.length >= 3) {
+      const v1 = pattern.vertices[face[0]];
+      const v2 = pattern.vertices[face[1]];
+      const v3 = pattern.vertices[face[2]];
+      
+      if (v1 && v2 && v3) {
+        // Calculate normal vector (simplified - assuming counter-clockwise winding)
+        const normal = calculateNormal(v1, v2, v3);
+        
+        stl += `facet normal ${normal.x.toFixed(6)} ${normal.y.toFixed(6)} ${normal.z.toFixed(6)}\n`;
+        stl += "  outer loop\n";
+        stl += `    vertex ${v1.x.toFixed(6)} ${v1.y.toFixed(6)} ${v1.z.toFixed(6)}\n`;
+        stl += `    vertex ${v2.x.toFixed(6)} ${v2.y.toFixed(6)} ${v2.z.toFixed(6)}\n`;
+        stl += `    vertex ${v3.x.toFixed(6)} ${v3.y.toFixed(6)} ${v3.z.toFixed(6)}\n`;
+        stl += "  endloop\n";
+        stl += "endfacet\n";
+      }
+    }
+  });
+  
+  stl += "endsolid Sacred_Geometry_Jewelry\n";
+  return stl;
+}
+
+// Calculate normal vector for a triangle
+function calculateNormal(v1: any, v2: any, v3: any): { x: number; y: number; z: number } {
+  // Vectors from v1 to v2 and v1 to v3
+  const u = { x: v2.x - v1.x, y: v2.y - v1.y, z: v2.z - v1.z };
+  const v = { x: v3.x - v1.x, y: v3.y - v1.y, z: v3.z - v1.z };
+  
+  // Cross product u × v
+  const normal = {
+    x: u.y * v.z - u.z * v.y,
+    y: u.z * v.x - u.x * v.z,
+    z: u.x * v.y - u.y * v.x
+  };
+  
+  // Normalize
+  const length = Math.sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+  if (length > 0) {
+    normal.x /= length;
+    normal.y /= length;
+    normal.z /= length;
+  }
+  
+  return normal;
 }
 
 // Helper function to calculate price multiplier based on parameters
